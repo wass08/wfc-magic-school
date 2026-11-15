@@ -4,10 +4,10 @@ import { moduleGeometry } from '../geo';
 import { createGhostMaterial } from '../render/materials';
 import { Stage } from '../render/stage';
 import { World } from '../render/world';
-import { candidatesAt } from '../wfc/fit';
+import { MAX_BUILD_LEVEL, candidatesAt } from '../wfc/fit';
 import { JOIN_SOCKETS } from '../wfc/modules';
 import { AIR_INDEX, VARIANTS, Variant } from '../wfc/variants';
-import { Pick, pickCell } from './pick';
+import { Pick, PickShape, pickCell } from './pick';
 
 const SOCKET_COLORS: Record<string, THREE.Color> = {
   w: new THREE.Color(2.2, 1.6, 0.6),
@@ -42,6 +42,21 @@ export class BuildMode {
   private pointer = new THREE.Vector2();
   private down: { x: number; y: number; button: number } | null = null;
   onHint: (msg: string) => void = () => {};
+  /** The hovered placement: module name and which of its fits is previewed (null = nothing fits). */
+  onState: (s: { name: string; index: number; count: number } | null) => void = () => {};
+  /** A module was placed / removed at these client coordinates (and grid cell). */
+  onPlace: (x: number, y: number, cell: [number, number, number], v: Variant) => void = () => {};
+  onRemove: (x: number, y: number, cell: [number, number, number], count: number) => void = () => {};
+  /** A click where nothing fits. */
+  onDenied: () => void = () => {};
+  /** The pointer moved onto another cell (`ok`: something fits there). */
+  onHoverCell: (cell: [number, number, number], ok: boolean) => void = () => {};
+  private lastClient = { x: 0, y: 0 };
+
+  /** Open sockets currently marked (valid while sockets are shown). */
+  get socketCount() {
+    return this.markers.count;
+  }
 
   constructor(private stage: Stage, private world: World) {
     const box = new THREE.BoxGeometry(CELL_W, CELL_H, CELL_W);
@@ -92,47 +107,34 @@ export class BuildMode {
     return v !== undefined && v !== AIR_INDEX;
   };
 
-  /** Bounds of each geometry above its base slab (plinths span the whole cell). */
-  private upperBounds = new Map<THREE.BufferGeometry, THREE.Box3 | null>();
-  private upperBox(geo: THREE.BufferGeometry | null | undefined): THREE.Box3 | null {
-    if (!geo) return null;
-    if (!this.upperBounds.has(geo)) {
-      const pos = geo.getAttribute('position');
-      const box = new THREE.Box3();
-      const v = new THREE.Vector3();
-      for (let i = 0; i < pos.count; i++) {
-        v.fromBufferAttribute(pos, i);
-        if (v.y > 0.12) box.expandByPoint(v);
-      }
-      this.upperBounds.set(geo, box.isEmpty() ? null : box);
-    }
-    return this.upperBounds.get(geo)!;
-  }
+  private pickMat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
 
   /**
-   * Tight pick volumes: the base slab (ground floor only) plus the structure's
-   * real bounds above it, so you can aim past slim towers and walls.
+   * Pick volumes: the base slab (ground floor only) plus the structure's real surface above it,
+   * so you can aim past slim towers and a wall's face never reads as its roof.
    */
-  private pickBox = (x: number, y: number, z: number): THREE.Box3[] | null => {
+  private pickBox = (x: number, y: number, z: number): PickShape[] | null => {
     const c = this.world.get(x, y, z);
     if (!c || c.v === AIR_INDEX) return null;
     const v = VARIANTS[c.v];
-    const boxes: THREE.Box3[] = [];
-    if (y === 0) boxes.push(new THREE.Box3(new THREE.Vector3(-2, -1, -2), new THREE.Vector3(2, 0.05, 2)));
-    const upper = v.module.category === 'ground' || v.module.category === 'garden' ? null : this.upperBox(moduleGeometry(v.module.id, c.style).castle);
-    if (upper) {
-      const b = upper.clone();
-      b.min.max(new THREE.Vector3(-2, 0, -2));
-      b.max.min(new THREE.Vector3(2, CELL_H, 2));
-      if (!b.isEmpty()) boxes.push(b);
-    }
     const r = (v.rot + c.vrot) % 4;
     const offset = new THREE.Vector3(x * CELL_W, y * CELL_H, z * CELL_W);
-    return boxes.map((b) => {
+    const shapes: PickShape[] = [];
+    const geo = v.module.category === 'ground' || v.module.category === 'garden' ? null : moduleGeometry(v.module.id, c.style).castle;
+    if (geo && !geo.boundingBox) geo.computeBoundingBox();
+    const upper = geo?.boundingBox ?? null;
+    // a flat tile is its slab; a structure is its own surface (plinth included)
+    if (y === 0 && !(geo && upper)) shapes.push({ box: new THREE.Box3(new THREE.Vector3(-2, -1, -2), new THREE.Vector3(2, 0.05, 2)).translate(offset) });
+    if (geo && upper) {
+      const b = upper.clone();
       // quarter-turn rotation about Y: (x, z) -> (z, -x) per step
       for (let k = 0; k < r; k++) b.set(new THREE.Vector3(b.min.z, b.min.y, -b.max.x), new THREE.Vector3(b.max.z, b.max.y, -b.min.x));
-      return b.translate(offset);
-    });
+      const mesh = new THREE.Mesh(geo, this.pickMat);
+      mesh.position.copy(offset);
+      mesh.rotation.y = (r * Math.PI) / 2;
+      shapes.push({ box: b.translate(offset), mesh });
+    }
+    return shapes;
   };
 
   private lastCam = new THREE.Matrix4();
@@ -143,10 +145,10 @@ export class BuildMode {
     const r = this.stage.renderer.domElement.getBoundingClientRect();
     this.pointer.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
     this.pointerIn = true;
-    this.repick();
+    this.repick(true);
   }
 
-  private repick() {
+  private repick(fromPointer = false) {
     this.raycaster.setFromCamera(this.pointer, this.stage.camera);
     this.lastCam.copy(this.stage.camera.matrixWorld);
     const p = pickCell(this.raycaster.ray, this.pickBox);
@@ -155,6 +157,7 @@ export class BuildMode {
     if (!same) {
       this.candIndex = 0;
       this.refresh();
+      if (fromPointer && p) this.onHoverCell(p.target, this.candidates.length > 0);
     }
   }
 
@@ -164,27 +167,34 @@ export class BuildMode {
     const button = this.down.button;
     this.down = null;
     if (moved) return;
+    this.lastClient = { x: e.clientX, y: e.clientY };
     if (button === 2 || (button === 0 && e.shiftKey)) this.removeHovered();
     else if (button === 0) this.place();
   }
 
   private onKey(e: KeyboardEvent) {
     if (!this.enabled || (e.target as HTMLElement).tagName === 'INPUT') return;
-    if (e.key === 'r' || e.key === 'R') {
-      if (this.candidates.length) {
-        this.candIndex = (this.candIndex + (e.shiftKey ? -1 : 1) + this.candidates.length) % this.candidates.length;
-        this.showGhost();
-      }
-    } else if (e.key === 'x' || e.key === 'Delete' || e.key === 'Backspace') {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'x' || e.key === 'Delete' || e.key === 'Backspace') {
       this.removeHovered();
     }
   }
 
+  /** Preview the next (or previous) variant that fits the hovered cell. */
+  cycle(dir = 1) {
+    if (!this.candidates.length) return false;
+    this.candIndex = (this.candIndex + dir + this.candidates.length) % this.candidates.length;
+    this.showGhost();
+    return this.candidates.length > 1;
+  }
+
   private place() {
-    if (!this.pick || !this.candidates.length) return;
+    if (!this.pick) return;
+    if (!this.candidates.length) return this.onDenied();
     const v = this.candidates[this.candIndex % this.candidates.length];
     const [x, y, z] = this.pick.target;
     this.world.set(x, y, z, v.index, this.stage.now());
+    this.onPlace(this.lastClient.x, this.lastClient.y, [x, y, z], v);
     this.pick = { hit: [x, y, z], target: [x, y + 1, z] };
     this.candIndex = 0;
     this.refresh();
@@ -194,7 +204,9 @@ export class BuildMode {
     if (!this.pick?.hit) return;
     const [x, y, z] = this.pick.hit;
     // removing a cell also removes whatever was stacked on it
-    for (let yy = y; this.world.get(x, yy, z); yy++) this.world.remove(x, yy, z);
+    let count = 0;
+    for (let yy = y; this.world.get(x, yy, z); yy++, count++) this.world.remove(x, yy, z);
+    this.onRemove(this.lastClient.x, this.lastClient.y, [x, y, z], count);
     this.pick = { target: [x, y, z] };
     this.refresh();
   }
@@ -205,7 +217,13 @@ export class BuildMode {
       return;
     }
     const [x, y, z] = this.pick.target;
-    this.candidates = candidatesAt(this.lookup, x, y, z, this.selected ?? undefined);
+    // auto mixes it up among equally good fits (one roll per module, so its turns stay together)
+    const rolls = new Map<string, number>();
+    const jitter = this.selected ? undefined : (id: string) => {
+      if (!rolls.has(id)) rolls.set(id, Math.random() * 1.6);
+      return rolls.get(id)!;
+    };
+    this.candidates = candidatesAt(this.lookup, x, y, z, this.selected ?? undefined, jitter);
     this.outline.position.set(x * CELL_W, y * CELL_H, z * CELL_W);
     this.outline.visible = true;
     this.showGhost();
@@ -217,9 +235,19 @@ export class BuildMode {
     this.ghost.clear();
     if (!ok || !this.pick) {
       this.ghost.visible = false;
-      const [, y] = this.pick?.target ?? [0, 0];
+      const [x, y, z] = this.pick?.target ?? [0, 0, 0];
       const name = this.selected ? VARIANTS.find((v) => v.module.id === this.selected)?.module.name : 'anything';
-      this.onHint(y > 0 && !this.pick?.hit ? 'Upper floors need something below' : `No socket fit for ${name} here`);
+      const below = y > 0 ? this.world.variantAt(x, y - 1, z) : undefined;
+      this.onHint(
+        y > MAX_BUILD_LEVEL
+          ? 'As high as the castle goes'
+          : below !== undefined && below !== AIR_INDEX && VARIANTS[below].topKey === 'air'
+            ? `Nothing stacks on a ${VARIANTS[below].module.name.toLowerCase()}`
+            : y > 0 && !this.pick?.hit
+              ? 'Upper floors need something below'
+              : `No socket fit for ${name} here`,
+      );
+      this.onState(null);
       return;
     }
     const v = this.candidates[this.candIndex % this.candidates.length];
@@ -230,7 +258,8 @@ export class BuildMode {
     this.ghost.rotation.y = (v.rot * Math.PI) / 2;
     this.ghost.visible = true;
     const n = this.candidates.length;
-    this.onHint(`${v.module.name}${n > 1 ? `  ·  ${(this.candIndex % n) + 1}/${n} fits (R to cycle)` : ''}`);
+    this.onHint('');
+    this.onState({ name: v.module.name, index: this.candIndex % n, count: n });
   }
 
   private rebuildMarkers() {

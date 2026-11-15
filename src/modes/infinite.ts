@@ -1,38 +1,18 @@
 import * as THREE from 'three';
 import { CELL_W, cellKey } from '../config';
 import { World } from '../render/world';
-import { WFCSolver } from '../wfc/solver';
+import { ChunkJob, ChunkResult, KNOWN_REACH } from '../wfc/chunkSolve';
 
-const CHUNK = 8;
+export const CHUNK = 8;
 const HEIGHT = 5;
 
 interface Chunk {
   cx: number;
   cz: number;
   shown: boolean;
+  /** waiting in `ready` to be revealed */
+  queued?: boolean;
 }
-
-interface Pending {
-  cx: number;
-  cz: number;
-  attempt: number;
-  margin: number;
-  /** solve region in cell coordinates */
-  x0: number;
-  z0: number;
-  sx: number;
-  sz: number;
-  solver: WFCSolver;
-  t0: number;
-}
-
-/** Contradictions tolerated at each margin before widening the repair region. */
-const LADDER: [margin: number, attempts: number][] = [
-  [0, 2],
-  [2, 8],
-  [3, 8],
-  [4, 12],
-];
 
 /**
  * Endless castle: chunks are solved on demand around the camera target, each
@@ -41,25 +21,43 @@ const LADDER: [margin: number, attempts: number][] = [
  * When a chunk can't be completed against its neighbours, the solve region is
  * widened into them ("modifying in blocks"): a margin of already-solved cells
  * is re-solved together with the new chunk, so the seam can resolve instead of
- * being cut. Far chunks are hidden but kept, so revisiting is stable.
+ * being cut. Far chunks are hidden but kept, so revisiting is stable (and they grow back in with
+ * the same reveal as the first time).
  */
 export class InfiniteWorld {
   private chunks = new Map<string, Chunk>();
   private store = new Map<string, number>();
-  private pending: Pending | null = null;
-  radius = 3;
+  /** chunk solves run in a worker; one at a time, so each sees its neighbours' final cells */
+  private worker = new Worker(new URL('../wfc/chunkWorker.ts', import.meta.url), { type: 'module' });
+  private jobId = 0;
+  private inFlight = 0;
+  /** solved or revisited chunks waiting to be revealed (one per frame) */
+  private ready: Chunk[] = [];
+  radius = 4;
   seed = 1;
   active = false;
   onStatus: (msg: string) => void = () => {};
+  /** Duration of the last chunk solve (ms). */
+  lastMs = 0;
 
-  constructor(private world: World, private now: () => number) {}
+  /** Chunks currently shown around the target. */
+  get awake() {
+    let n = 0;
+    for (const c of this.chunks.values()) if (c.shown) n++;
+    return n;
+  }
+
+  constructor(private world: World, private now: () => number) {
+    this.worker.onmessage = (e: MessageEvent<ChunkResult>) => this.receive(e.data);
+  }
 
   start(seed: number) {
     this.seed = seed;
     this.chunks.clear();
     this.store.clear();
     this.world.clear();
-    this.pending = null;
+    this.inFlight = 0;
+    this.ready = [];
     this.active = true;
   }
 
@@ -71,67 +69,53 @@ export class InfiniteWorld {
     return this.chunks.get(`${Math.floor(x / CHUNK)},${Math.floor(z / CHUNK)}`);
   }
 
-  private begin(cx: number, cz: number, attempt: number, t0 = performance.now()): Pending {
-    let margin = LADDER[LADDER.length - 1][0];
-    let budget = 0;
-    for (const [m, n] of LADDER) {
-      budget += n;
-      if (attempt < budget) {
-        margin = m;
-        break;
-      }
-    }
-    const giveUp = attempt >= budget && attempt >= LADDER.reduce((a, [, n]) => a + n, 0);
-    // only grow into neighbours that exist: unsolved areas stay untouched
+  /** Hand the chunk to the solver worker with the decided cells it may lean on. */
+  private request(cx: number, cz: number) {
+    const known: number[] = [];
+    const R = KNOWN_REACH;
+    for (let y = 0; y < HEIGHT; y++)
+      for (let z = cz * CHUNK - R; z < (cz + 1) * CHUNK + R; z++)
+        for (let x = cx * CHUNK - R; x < (cx + 1) * CHUNK + R; x++) {
+          const v = this.store.get(cellKey(x, y, z));
+          if (v !== undefined) known.push(x, y, z, v);
+        }
     const has = (dx: number, dz: number) => this.chunks.has(`${cx + dx},${cz + dz}`);
-    const mW = has(-1, 0) ? margin : 0, mE = has(1, 0) ? margin : 0;
-    const mN = has(0, -1) ? margin : 0, mS = has(0, 1) ? margin : 0;
-    const x0 = cx * CHUNK - mW, z0 = cz * CHUNK - mN;
-    const sx = CHUNK + mW + mE, sz = CHUNK + mN + mS;
-    const inside = (x: number, z: number) => x >= x0 && x < x0 + sx && z >= z0 && z < z0 + sz;
-    const seed = ((this.seed * 73856093) ^ (cx * 19349663) ^ (cz * 83492791)) + attempt * 7919;
-    const solver = new WFCSolver({
-      sx, sy: HEIGHT, sz,
-      ox: x0, oz: z0,
-      seed,
-      // last resort only: ignore neighbours (a visible seam beats a hole)
-      external: giveUp ? undefined : (x, y, z) => (inside(x, z) ? undefined : this.store.get(cellKey(x, y, z))),
-    });
-    return { cx, cz, attempt, margin, x0, z0, sx, sz, solver, t0 };
+    const job: ChunkJob = {
+      id: ++this.jobId,
+      cx, cz,
+      chunk: CHUNK,
+      height: HEIGHT,
+      worldSeed: this.seed,
+      has: [has(-1, 0), has(1, 0), has(0, -1), has(0, 1)],
+      known: new Int32Array(known),
+    };
+    this.inFlight = job.id;
+    this.worker.postMessage(job, [job.known.buffer]);
   }
 
-  /** Advance the pending solve within a time budget; returns the chunk once done. */
-  private advance(budgetMs: number): Chunk | null {
-    let p = this.pending!;
-    const t0 = performance.now();
-    while (performance.now() - t0 < budgetMs) {
-      const r = p.solver.step();
-      if (r === null) {
-        p = this.pending = this.begin(p.cx, p.cz, p.attempt + 1, p.t0);
-        continue;
-      }
-      if (r.length) continue;
-      const chunk: Chunk = { cx: p.cx, cz: p.cz, shown: false };
-      this.chunks.set(`${p.cx},${p.cz}`, chunk);
-      const now = this.now();
-      for (let i = 0; i < p.solver.n; i++) {
-        const [x, y, z] = p.solver.world(i);
-        let variant = -1;
-        p.solver.forEach(i, (q) => (variant = q));
-        const owner = this.chunkOf(x, z);
-        if (!owner) continue; // corner of an unsolved diagonal chunk: leave it free
-        const key = cellKey(x, y, z);
-        if (this.store.get(key) === variant) continue;
-        this.store.set(key, variant);
-        // repaired margin cells of visible neighbours update in place
-        if (owner !== chunk && owner.shown) this.world.set(x, y, z, variant, now);
-      }
-      const extra = p.attempt ? ` (${p.attempt} restarts${p.margin ? `, repaired ${p.margin}-cell margin` : ''})` : '';
-      this.onStatus(`${this.chunks.size} chunks · last solved in ${(performance.now() - p.t0).toFixed(0)} ms${extra}`);
-      this.pending = null;
-      return chunk;
+  /** A solved chunk is back: store it, and update repaired margins of visible neighbours. */
+  private receive(r: ChunkResult) {
+    if (r.id !== this.inFlight) return; // from a world that was replaced meanwhile
+    this.inFlight = 0;
+    if (!this.active) return;
+    const chunk: Chunk = { cx: r.cx, cz: r.cz, shown: false };
+    this.chunks.set(`${r.cx},${r.cz}`, chunk);
+    const now = this.now();
+    for (let i = 0; i < r.cells.length; i += 4) {
+      const x = r.cells[i], y = r.cells[i + 1], z = r.cells[i + 2], variant = r.cells[i + 3];
+      const owner = this.chunkOf(x, z);
+      if (!owner) continue; // corner of an unsolved diagonal chunk: leave it free
+      const key = cellKey(x, y, z);
+      if (this.store.get(key) === variant) continue;
+      this.store.set(key, variant);
+      // repaired margin cells of visible neighbours update in place
+      if (owner !== chunk && owner.shown) this.world.set(x, y, z, variant, now);
     }
-    return null;
+    const extra = r.attempts ? ` (${r.attempts} restarts${r.margin ? `, repaired ${r.margin}-cell margin` : ''})` : '';
+    this.lastMs = r.ms;
+    this.onStatus(`${this.chunks.size} chunks · last solved in ${r.ms.toFixed(0)} ms${extra}`);
+    chunk.queued = true;
+    this.ready.push(chunk);
   }
 
   private show(c: Chunk, animate: boolean) {
@@ -169,16 +153,30 @@ export class InfiniteWorld {
         const d = dx * dx + dz * dz;
         if (d > r * r + 1) continue;
         const c = this.chunks.get(`${ccx + dx},${ccz + dz}`);
-        if (c && !c.shown) this.show(c, false);
+        // coming back to a hidden chunk: queue it for the same animated reveal as a new one
+        if (c && !c.shown && !c.queued) {
+          c.queued = true;
+          this.ready.push(c);
+        }
         if (!c && d < bestD) {
           bestD = d;
           best = [ccx + dx, ccz + dz];
         }
       }
-    if (!this.pending && best) this.pending = this.begin(best[0], best[1], 0);
-    if (this.pending) {
-      const c = this.advance(6);
-      if (c) this.show(c, true);
+    if (!this.inFlight && best) this.request(best[0], best[1]);
+    // reveal one chunk per frame (each reveal re-packs the instance buffers), nearest first;
+    // ones the camera has already left again are dropped from the queue
+    const far = (c: Chunk) => (c.cx - ccx) ** 2 + (c.cz - ccz) ** 2;
+    this.ready = this.ready.filter((c) => {
+      if (far(c) <= (r + 1.5) * (r + 1.5)) return true;
+      c.queued = false;
+      return false;
+    });
+    if (this.ready.length > 1) this.ready.sort((a, b) => far(a) - far(b));
+    const c = this.ready.shift();
+    if (c) {
+      c.queued = false;
+      this.show(c, true);
     }
 
     for (const c of this.chunks.values()) {

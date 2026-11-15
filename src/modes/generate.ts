@@ -35,6 +35,15 @@ export class Generator {
   private attempt = 0;
   onStatus: (msg: string) => void = () => {};
   onDone: () => void = () => {};
+  /** Pieces about to pop in (spawn: stage time each one starts growing). */
+  onReveal: (cells: { x: number; y: number; z: number; v: number; spawn: number }[]) => void = () => {};
+  /** Cells decided so far in the current run, out of `total`. */
+  done = 0;
+  total = 0;
+  /** Wall-clock duration of the last finished run (ms). */
+  lastMs = 0;
+  /** time spent inside the solver during an animated run */
+  private solveMs = 0;
 
   constructor(private world: World, private now: () => number) {}
 
@@ -50,6 +59,9 @@ export class Generator {
     this.params = params;
     this.region = region;
     this.attempt = 0;
+    this.done = 0;
+    this.total = region.sx * region.sy * region.sz;
+    this.solveMs = 0;
     this.snapshot = new Map(this.world.cells);
     this.fixed.clear();
     const { x0, z0, sx, sy, sz } = region;
@@ -70,12 +82,18 @@ export class Generator {
       }
       const now = this.now();
       const cx = x0 + sx / 2, cz = z0 + sz / 2;
+      const shown: { x: number; y: number; z: number; v: number; spawn: number }[] = [];
       for (const c of r.cells) {
         if (this.fixed.has(c.x - x0 + sx * (c.z - z0 + sz * c.y)) && this.world.variantAt(c.x, c.y, c.z) === c.variant) continue;
         const dist = Math.hypot(c.x - cx, c.z - cz);
-        this.world.set(c.x, c.y, c.z, c.variant, now + dist * 0.045 + c.y * 0.12);
+        const spawn = now + dist * 0.045 + c.y * 0.12;
+        this.world.set(c.x, c.y, c.z, c.variant, spawn);
+        if (c.variant !== AIR_INDEX) shown.push({ x: c.x, y: c.y, z: c.z, v: c.variant, spawn });
       }
-      this.onStatus(`Solved ${r.cells.length} cells in ${(performance.now() - t0).toFixed(0)} ms (${r.tries} ${r.tries > 1 ? 'tries' : 'try'})`);
+      this.onReveal(shown);
+      this.done = this.total;
+      this.lastMs = performance.now() - t0;
+      this.onStatus(`Solved ${r.cells.length} cells in ${this.lastMs.toFixed(0)} ms (${r.tries} ${r.tries > 1 ? 'tries' : 'try'})`);
       this.onDone();
       return;
     }
@@ -102,13 +120,17 @@ export class Generator {
     if (!this.solver || !this.params || !this.region) return;
     const now = this.now();
     let revealed = 0;
+    const shown: { x: number; y: number; z: number; v: number; spawn: number }[] = [];
     while (revealed < this.params.speed) {
+      const ts = performance.now();
       const r = this.solver.step();
+      this.solveMs += performance.now() - ts;
       if (r === null) {
         // contradiction: roll back and retry with another seed
         this.attempt++;
         this.world.clear();
         for (const [, c] of this.snapshot!) this.world.set(c.x, c.y, c.z, c.v, c.spawn);
+        this.done = 0;
         if (this.attempt > 40) {
           this.solver = null;
           this.onStatus('Gave up after 40 contradictions.');
@@ -119,18 +141,26 @@ export class Generator {
         return;
       }
       if (r.length === 0) {
+        this.onReveal(shown);
         this.solver = null;
+        this.done = this.total;
+        this.lastMs = this.solveMs;
         this.onStatus(`Collapsed ${this.region.sx * this.region.sy * this.region.sz} cells${this.attempt ? ` after ${this.attempt} restarts` : ''}`);
         this.onDone();
         return;
       }
+      this.done += r.length;
       for (const c of r) {
         const existing = this.world.get(c.x, c.y, c.z);
         if (existing && existing.v === c.variant) continue;
         this.world.set(c.x, c.y, c.z, c.variant, now);
-        if (c.variant !== AIR_INDEX) revealed++;
+        if (c.variant !== AIR_INDEX) {
+          revealed++;
+          shown.push({ x: c.x, y: c.y, z: c.z, v: c.variant, spawn: now });
+        }
       }
     }
+    this.onReveal(shown);
   }
 }
 

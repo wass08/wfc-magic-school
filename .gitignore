@@ -5,3 +5,10 @@ shots
 
 # local reference images (not published)
 references/
+
+# source art (the app ships the compressed copies in public/textures)
+art/
+
+# local tooling
+.claude/
+.vercel

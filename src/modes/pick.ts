@@ -8,12 +8,52 @@ export interface Pick {
   target: [number, number, number];
 }
 
-/** World-space pick boxes of an occupied cell (empty array or null if the cell is empty). */
-export type PickBox = (x: number, y: number, z: number) => THREE.Box3[] | null;
+/**
+ * A pick volume of an occupied cell: a box, or (with `mesh`) the module's real surface, where the
+ * box is only the broad phase. Boxes around buildings with tall roofs reach above their walls, so
+ * aiming at a wall from above would enter the box through its top and target the cell on the roof.
+ */
+export interface PickShape {
+  box: THREE.Box3;
+  mesh?: THREE.Mesh;
+}
+
+/** World-space pick volumes of an occupied cell (empty array or null if the cell is empty). */
+export type PickBox = (x: number, y: number, z: number) => PickShape[] | null;
 
 const GROUND_Y = -1;
 const MAX_LEVEL = 14;
 const _hit = new THREE.Vector3();
+const _rc = new THREE.Raycaster();
+const _hits: THREE.Intersection[] = [];
+
+/** Nearest hit on a mesh's surface, with the normal facing the viewer. */
+function surfaceHit(ray: THREE.Ray, mesh: THREE.Mesh) {
+  _rc.ray.copy(ray);
+  _hits.length = 0;
+  mesh.updateMatrixWorld();
+  mesh.raycast(_rc, _hits);
+  let best: THREE.Intersection | null = null;
+  for (const h of _hits) if (h.face && (!best || h.distance < best.distance)) best = h;
+  if (!best) return null;
+  const n = best.face!.normal.clone().transformDirection(mesh.matrixWorld);
+  if (n.dot(ray.direction) > 0) n.negate();
+  return { d: best.distance, n, y: best.point.y };
+}
+
+/**
+ * Neighbour the surface faces: the floor above for flat faces near the top of the module, else
+ * the side the face (or, for ledges and sills partway up a wall, the viewer) looks toward.
+ */
+function normalTarget(n: THREE.Vector3, hy: number, dir: THREE.Vector3, [x, y, z]: [number, number, number]): [number, number, number] {
+  const up = (hy - y * CELL_H) / CELL_H;
+  if (n.y > 0.65 && up > 0.6) return [x, y + 1, z];
+  if (n.y < -0.65 && up < 0.3 && y > 0) return [x, y - 1, z];
+  // flat ledges low on a wall carry no side of their own: take the one facing the viewer
+  const h = Math.abs(n.y) > 0.65 ? _side.set(-dir.x, 0, -dir.z) : _side.set(n.x, 0, n.z);
+  return Math.abs(h.x) > Math.abs(h.z) ? [x + Math.sign(h.x), y, z] : [x, y, z + Math.sign(h.z)];
+}
+const _side = new THREE.Vector3();
 
 /**
  * Voxel DDA (Amanatides & Woo) through the cell grid. Each visited cell is
@@ -44,16 +84,25 @@ export function pickCell(ray: THREE.Ray, pickBox: PickBox): Pick | null {
   for (let i = 0; i < 800; i++) {
     if (iy >= -1 && iy <= MAX_LEVEL) {
       const cy = Math.max(iy, 0);
-      let best: { box: THREE.Box3; p: THREE.Vector3; d: number } | null = null;
-      for (const box of pickBox(ix, cy, iz) ?? []) {
-        if (!ray.intersectBox(box, _hit)) continue;
+      const hit: [number, number, number] = [ix, cy, iz];
+      let best: { target: [number, number, number]; d: number } | null = null;
+      for (const s of pickBox(ix, cy, iz) ?? []) {
+        if (!ray.intersectBox(s.box, _hit)) continue;
+        if (s.mesh) {
+          const h = surfaceHit(ray, s.mesh);
+          if (h) {
+            if (!best || h.d < best.d) best = { target: normalTarget(h.n, h.y, d, hit), d: h.d };
+          } else if (_hit.y < s.box.max.y - 1e-3 && _hit.y - cy * CELL_H < CELL_H * 0.6) {
+            // in through a doorway, an arch or a hall's open end: that side, not the floor inside
+            const dist = _hit.distanceTo(o);
+            if (!best || dist < best.d) best = { target: sideTarget(s.box, _hit, hit), d: dist };
+          }
+          continue;
+        }
         const dist = _hit.distanceTo(o);
-        if (!best || dist < best.d) best = { box, p: _hit.clone(), d: dist };
+        if (!best || dist < best.d) best = { target: faceTarget(s.box, _hit, hit), d: dist };
       }
-      if (best) {
-        const hit: [number, number, number] = [ix, cy, iz];
-        return { hit, target: faceTarget(best.box, best.p, hit) };
-      }
+      if (best) return { hit, target: best.target };
     }
     if (iy < -1) break;
     if (iy > MAX_LEVEL && sy >= 0) return null;
@@ -76,6 +125,18 @@ export function pickCell(ray: THREE.Ray, pickBox: PickBox): Pick | null {
   // ground under an occupied cell (e.g. the corner of a round tower's cell)
   if (pickBox(...target)?.length) return null;
   return { target };
+}
+
+/** Neighbour across the box's side face closest to the hit point. */
+function sideTarget(box: THREE.Box3, p: THREE.Vector3, [x, y, z]: [number, number, number]): [number, number, number] {
+  const faces: [number, [number, number, number]][] = [
+    [Math.abs(p.x - box.max.x), [x + 1, y, z]],
+    [Math.abs(p.x - box.min.x), [x - 1, y, z]],
+    [Math.abs(p.z - box.max.z), [x, y, z + 1]],
+    [Math.abs(p.z - box.min.z), [x, y, z - 1]],
+  ];
+  faces.sort((a, b) => a[0] - b[0]);
+  return faces[0][1];
 }
 
 /** Neighbour across the box face closest to the hit point. */

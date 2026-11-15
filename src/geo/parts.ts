@@ -34,6 +34,8 @@ export const S = {
   gold: (): PartStyle => ({ color: C.gold, mat: MAT.gold }),
   iron: (): PartStyle => ({ color: C.iron, mat: MAT.iron }),
   glass: (purple = false): PartStyle => (purple ? { color: C.magic, mat: MAT.glass, emi: 1.5, flick: 0.15 } : { color: C.glass, mat: MAT.glass, emi: 1.15, flick: 0.12 }),
+  /** warm glass looking into a painted room (interior mapping), pane w × h */
+  interior: (w: number, h: number): PartStyle => ({ color: C.glass, mat: MAT.interior, emi: 1.15, flick: 0.05, win: { w, h } }),
   flame: (): PartStyle => ({ color: '#ffa040', mat: MAT.plain, emi: 2.6, flick: 0.7 }),
   magic: (): PartStyle => ({ color: C.magic, mat: MAT.magic, emi: 2.6, flick: 0.45 }),
   leaf: (color: string, sway = 0.025): PartStyle => ({ color, mat: MAT.foliage, sway }),
@@ -179,13 +181,18 @@ export const torusGeo = (r: number, t: number) => shaped(`to${r},${t}`, () => ne
 /**
  * Gothic window on a face whose outward normal is local +Z (after ry).
  * (x,y,z) is the bottom-centre of the opening on the face plane.
+ * `interior` swaps the glowing glass for a painted room seen through the pane.
  */
-export function gothicWindow(b: GeoBuilder, x: number, y: number, z: number, ry: number, w: number, h: number, purple = false, frame = C.stoneLight) {
+export function gothicWindow(b: GeoBuilder, x: number, y: number, z: number, ry: number, w: number, h: number, purple = false, frame = C.stoneLight, interior = true) {
+  const room = interior;
   b.at(x, y, z, ry, () => {
-    b.add(archFillGeo(w, h), mat4(0, 0, 0.012), S.glass(purple));
+    b.add(archFillGeo(w, h), mat4(0, 0, 0.012), room ? S.interior(w, h) : S.glass(purple));
     b.add(archFrameGeo(w, h, 0.07, 0.1), mat4(0, 0, -0.03), S.stone(frame));
-    b.box(0.05, h * 0.82, 0.05, 0, h * 0.41, 0.03, S.stone(frame));
-    if (h > w * 1.6) b.box(w, 0.045, 0.05, 0, h * 0.5, 0.03, S.stone(frame));
+    // plain glass gets a mullion and a transom; a room window stays one open pane of leaded glass
+    if (!room) {
+      b.box(0.05, h * 0.82, 0.05, 0, h * 0.41, 0.03, S.stone(frame));
+      if (h > w * 1.6) b.box(w, 0.045, 0.05, 0, h * 0.5, 0.03, S.stone(frame));
+    }
     b.box(w + 0.24, 0.08, 0.18, 0, -0.04, 0.05, S.stone(frame));
   });
 }
@@ -341,7 +348,7 @@ export function bush(b: GeoBuilder, rng: RNG, x: number, z: number, s = 1, y = 0
 export function dormer(b: GeoBuilder, x: number, y: number, z: number, ry: number, s = 1) {
   b.at(x, y, z, ry, () => {
     b.block(0.5 * s, 0.5 * s, 0.7 * s, 0, 0, -0.25 * s, S.stone());
-    b.add(archFillGeo(0.24 * s, 0.34 * s), mat4(0, 0.06 * s, 0.105 * s), S.glass());
+    b.add(archFillGeo(0.24 * s, 0.34 * s), mat4(0, 0.06 * s, 0.105 * s), S.interior(0.24 * s, 0.34 * s));
     b.add(archFrameGeo(0.24 * s, 0.34 * s, 0.05 * s, 0.05), mat4(0, 0.06 * s, 0.08 * s), S.wood());
     b.add(prismGeo(0.86 * s, 0.33 * s, 0.32 * s), mat4(0, 0.5 * s, 0.13 * s, Math.PI / 2), S.roof());
     finial(b, 0, 0.8 * s, 0.1 * s, 0.5 * s);
@@ -484,9 +491,10 @@ export function pennant(b: GeoBuilder, x: number, y: number, z: number, len: num
 }
 
 /** Rose window on a face with outward normal local +Z (after ry), centred at (x, y, z). */
-export function roseWindow(b: GeoBuilder, x: number, y: number, z: number, ry: number, r: number, purple = true) {
+export function roseWindow(b: GeoBuilder, x: number, y: number, z: number, ry: number, r: number, _purple = true) {
   b.at(x, y, z, ry, () => {
-    b.add(cached2(`rose${r}`, () => new THREE.CircleGeometry(r, 24)), mat4(0, 0, 0.012), S.glass(purple));
+    // a room behind the rose too (pane coordinates want y from 0 at the bottom, so it sits on its rim)
+    b.add(cached2(`rose${r}`, () => new THREE.CircleGeometry(r, 24).translate(0, r, 0)), mat4(0, -r, 0.012), S.interior(r * 2, r * 2));
     b.add(torusGeo(r + 0.04, 0.07), mat4(0, 0, 0.04), S.stone(C.stoneLight));
     b.add(torusGeo(r * 0.32, 0.035), mat4(0, 0, 0.04), S.stone(C.stoneLight));
     for (let k = 0; k < 8; k++) {

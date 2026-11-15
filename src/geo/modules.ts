@@ -231,7 +231,7 @@ const towerCrown: Build = (b, rng, style) => {
 
 // --- halls ---------------------------------------------------------------------
 
-export function hallBody(b: GeoBuilder, rng: RNG, x0: number, x1: number, style: number, upper: boolean) {
+export function hallBody(b: GeoBuilder, rng: RNG, x0: number, x1: number, style: number, upper: boolean, rooms = true) {
   const len = x1 - x0;
   const cx = (x0 + x1) / 2;
   if (!upper) b.block(len, 0.35, HALL_HW * 2 + 0.22, cx, 0, 0, S.stone(C.stoneDark));
@@ -247,7 +247,7 @@ export function hallBody(b: GeoBuilder, rng: RNG, x0: number, x1: number, style:
     const slots = len > 3 ? [-1, 1] : [0.2];
     slots.forEach((sx, i) => {
       const purple = style === 1 && (i + (side > 0 ? 0 : 1)) % 2 === 0;
-      gothicWindow(b, cx + sx, winY, z, ry, winW, winH, purple);
+      gothicWindow(b, cx + sx, winY, z, ry, winW, winH, purple, undefined, rooms);
     });
     // buttress between bays
     if (len > 3) {
@@ -265,7 +265,8 @@ export function hallBody(b: GeoBuilder, rng: RNG, x0: number, x1: number, style:
 
 const hall: Build = (b, rng, style) => {
   plinth(b);
-  hallBody(b, rng, -HALF, HALF, style, false);
+  // experiment: the ground-floor hall's windows look into a painted library
+  hallBody(b, rng, -HALF, HALF, style, false, true);
 };
 const hallUpper: Build = (b, rng, style) => hallBody(b, rng, -HALF, HALF, style, true);
 
@@ -424,27 +425,30 @@ const water: Build = (b, rng, style) => {
 /** Decoration: tower entrance facing +X (placed on a side with walkable ground). */
 const towerDoor: Build = (b) => {
   door(b, TOWER_R - 0.02, 0.02, 0, outward(0), 0.85, 1.5);
-  for (let i = 0; i < 3; i++) b.block(0.5 - i * 0.14, 0.1, 1.3 - i * 0.12, TOWER_R + 0.38 - i * 0.07, i * 0.1 - 0.05, 0, S.paving(C.stoneLight));
+  // steps stand 1 cm proud of the plinth (flush tops would z-fight)
+  for (let i = 0; i < 3; i++) b.block(0.5 - i * 0.14, 0.1, 1.3 - i * 0.12, TOWER_R + 0.38 - i * 0.07, i * 0.1 - 0.04, 0, S.paving(C.stoneLight));
   lantern(b, TOWER_R, 1.85, 0, outward(0));
 };
 
 /** Decoration: small door on a wall turret, facing +X. */
 const turretDoor: Build = (b) => {
   door(b, 0.83, 0.02, 0, outward(0), 0.5, 0.95);
-  b.block(0.3, 0.08, 0.8, 1.0, -0.03, 0, S.paving(C.stoneLight));
+  b.block(0.3, 0.09, 0.8, 1.0, -0.03, 0, S.paving(C.stoneLight));
 };
 
 /** Decoration: wall stub bridging a tower to a wall arriving on its +X side. */
-const towerWallStub: Build = (b, rng) => wallRun(b, rng, 1.0, HALF, 0, false);
+// (a hair past the cell edge, so its ends aren't flush with the tower's plinth)
+const towerWallStub: Build = (b, rng) => wallRun(b, rng, 1.0, HALF + 0.002, 0, false);
 
 /** Decoration: canal bank on +X side of a water cell. */
 const bank: Build = (b) => {
-  b.block(0.25, 1.1, CELL_W, HALF - 0.125, -1.0, 0, S.stone());
+  // stands on the canal's floor slab (sides flush with it would z-fight)
+  b.block(0.25, 1.0, CELL_W, HALF - 0.125, -0.9, 0, S.stone());
   b.block(0.34, 0.12, CELL_W, HALF - 0.17, 0.0, 0, S.paving(C.stoneLight));
 };
 /** Decoration: corner post at (+X,+Z) of a water cell. */
 const bankCorner: Build = (b) => {
-  b.block(0.25, 1.1, 0.25, HALF - 0.125, -1.0, HALF - 0.125, S.stone());
+  b.block(0.25, 1.0, 0.25, HALF - 0.125, -0.9, HALF - 0.125, S.stone());
   b.block(0.34, 0.12, 0.34, HALF - 0.17, 0.0, HALF - 0.17, S.paving(C.stoneLight));
 };
 

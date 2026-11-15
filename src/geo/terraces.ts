@@ -131,23 +131,36 @@ const stairs: Build = (b, rng, style) => {
  * Covered gallery along X from x0 to x1, floor at deckY, half width hw.
  * style 0: timber with leaded windows; style 1: stone corridor.
  */
+/** Covered gallery along X: open timber (style 0) or stone with windows (style 1). */
 function galleryRun(b: GeoBuilder, x0: number, x1: number, deckY: number, hw: number, style: number) {
   const len = x1 - x0, cx = (x0 + x1) / 2;
   const wallH = 1.85;
   b.block(len, 0.16, hw * 2 + 0.2, cx, deckY - 0.16, 0, S.stone(C.stoneLight));
   b.block(len, 0.04, hw * 2, cx, deckY, 0, S.wood());
-  if (style === 0) {
+  if (style !== 1) {
+    // open timber gallery: posts and a low balustrade, see-through, lit by hanging lanterns
     const n = Math.max(1, Math.round(len / 0.95));
     const pitch = len / n;
     for (const side of [1, -1]) {
-      const z = side * hw, ry = side > 0 ? 0 : Math.PI;
-      for (let i = 0; i <= n; i++) b.block(0.12, wallH, 0.12, x0 + pitch * i, deckY, z, S.wood(C.woodDark));
-      for (let i = 0; i < n; i++) {
-        const bx = x0 + pitch * (i + 0.5);
-        b.block(pitch - 0.12, 0.5, 0.05, bx, deckY, z, S.wood());
-        if (pitch > 0.6) gothicWindow(b, bx, deckY + 0.68, z, ry, Math.min(0.55, pitch - 0.35), 0.95, false, C.wood);
+      const z = side * hw;
+      for (let i = 0; i <= n; i++) {
+        const px = x0 + pitch * i;
+        b.block(0.12, wallH, 0.12, px, deckY, z, S.wood(C.woodDark));
+        // little corbels under the head beam
+        b.block(0.24, 0.08, 0.14, px, deckY + wallH - 0.22, z, S.wood(C.woodDark));
       }
+      b.block(len, 0.06, 0.1, cx, deckY + 0.56, z, S.wood(C.woodDark)); // hand rail
+      b.block(len, 0.05, 0.07, cx, deckY + 0.06, z, S.wood()); // bottom rail
+      for (let i = 0; i < n; i++)
+        for (let k = 1; k < 5; k++) b.block(0.035, 0.46, 0.035, x0 + pitch * i + (pitch * k) / 5, deckY + 0.1, z, S.wood());
       b.block(len, 0.14, 0.18, cx, deckY + wallH - 0.14, z, S.wood(C.woodDark));
+    }
+    // tie beams across the end bays (and the middle one), each carrying a lantern
+    for (let i = 0; i < n; i++) {
+      const bx = x0 + pitch * (i + 0.5);
+      if (!(i === 0 || i === n - 1 || (n % 2 === 1 && i === (n - 1) / 2))) continue;
+      b.block(0.1, 0.1, hw * 2, bx, deckY + wallH - 0.12, 0, S.wood(C.woodDark));
+      hangingLantern(b, bx, deckY + wallH - 0.12, 0);
     }
   } else {
     for (const side of [1, -1]) {
@@ -227,7 +240,6 @@ const wallGallery: Build = (b, rng) => {
   // jettied timber gallery on corbels along the wall walk
   for (let x = -1.75; x <= 1.76; x += 0.5) for (const side of [1, -1]) b.block(0.14, 0.2, 0.3, x, WALL_H - 0.2, side * 0.6, S.stone(C.stoneLight));
   galleryRun(b, -HALF, HALF, WALL_H, 0.72, 0);
-  hangingLantern(b, 0, WALL_H + 1.75, 0);
 };
 
 // --- chapels ------------------------------------------------------------------------

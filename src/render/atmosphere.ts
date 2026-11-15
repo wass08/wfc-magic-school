@@ -1,67 +1,81 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { abs, float, fract, length, max, min, mix, sin, smoothstep, uniform, vec2, vec3 } from 'three/tsl';
 import { globalUniforms } from './materials';
+import { makeSpriteCloud, markSpriteCloudDirty, spriteSize, spriteUV } from './sprites';
 
 /** Chimney smoke: a few soft puffs per source, animated entirely in the shader. */
 export class Smoke {
-  readonly points: THREE.Points<THREE.BufferGeometry, THREE.ShaderMaterial>;
+  readonly points = new THREE.Group();
+  private sprite: THREE.Sprite | null = null;
+  private pos = new Float32Array(0);
+  private phase = new Float32Array(0);
+  private cap = 0;
   private sources: Float32Array | null = null;
   private static PER_SOURCE = 7;
 
   constructor() {
-    const mat = new THREE.ShaderMaterial({
-      transparent: true,
-      depthWrite: false,
-      uniforms: { uTime: globalUniforms.uTime, uNight: globalUniforms.uNight },
-      vertexShader: /* glsl */ `
-        attribute float aPhase;
-        uniform float uTime;
-        varying float vA;
-        void main() {
-          float t = fract(uTime * 0.11 + aPhase);
-          vec3 p = position;
-          p += vec3(sin(aPhase * 40.0 + t * 3.0) * 0.25 * t + t * 1.4, t * 4.5, cos(aPhase * 23.0 + t * 2.0) * 0.25 * t + t * 0.7);
-          vec4 mv = modelViewMatrix * vec4(p, 1.0);
-          gl_Position = projectionMatrix * mv;
-          gl_PointSize = (14.0 + 70.0 * t) * (12.0 / -mv.z);
-          vA = smoothstep(0.0, 0.12, t) * (1.0 - t);
-        }`,
-      fragmentShader: /* glsl */ `
-        uniform float uNight;
-        varying float vA;
-        void main() {
-          float d = length(gl_PointCoord - 0.5);
-          float a = smoothstep(0.5, 0.1, d) * vA * 0.32;
-          vec3 c = mix(vec3(0.78, 0.74, 0.8), vec3(0.32, 0.3, 0.42), uNight);
-          gl_FragColor = vec4(c, a);
-        }`,
-    });
-    this.points = new THREE.Points(new THREE.BufferGeometry(), mat);
-    this.points.frustumCulled = false;
     this.points.renderOrder = 5;
+  }
+
+  /** (Re)build the sprite cloud with room for `n` puffs (only when it has to grow). */
+  private ensure(n: number) {
+    if (n <= this.cap && this.sprite) return;
+    let cap = Math.max(256, this.cap);
+    while (cap < n) cap *= 2;
+    this.cap = cap;
+    if (this.sprite) {
+      this.points.remove(this.sprite);
+      (this.sprite.material as THREE.Material).dispose();
+    }
+    this.pos = new Float32Array(cap * 3);
+    this.phase = new Float32Array(cap);
+    this.sprite = makeSpriteCloud(
+      0,
+      this.pos,
+      this.phase,
+      (m, P, S) => {
+        const { uTime, uNight } = globalUniforms;
+        const t = fract(uTime.mul(0.11).add(S));
+        const drift = vec3(
+          sin(S.mul(40).add(t.mul(3))).mul(0.25).mul(t).add(t.mul(1.4)),
+          t.mul(4.5),
+          sin(S.mul(23).add(t.mul(2)).add(Math.PI / 2)).mul(0.25).mul(t).add(t.mul(0.7)),
+        );
+        const center = P.add(drift);
+        m.positionNode = center;
+        m.sizeNode = spriteSize(center, t.mul(70).add(14).mul(12));
+        const vA = smoothstep(0, 0.12, t).mul(float(1).sub(t));
+        const d = length(spriteUV().sub(0.5));
+        m.colorNode = mix(vec3(0.78, 0.74, 0.8), vec3(0.32, 0.3, 0.42), uNight);
+        m.opacityNode = smoothstep(0.5, 0.1, d).mul(vA).mul(0.32);
+      },
+      THREE.NormalBlending,
+    );
+    this.sprite.renderOrder = 5;
+    this.points.add(this.sprite);
   }
 
   setSources(src: Float32Array) {
     if (src === this.sources) return;
     this.sources = src;
     const n = (src.length / 3) * Smoke.PER_SOURCE;
-    const pos = new Float32Array(n * 3);
-    const phase = new Float32Array(n);
+    this.ensure(n);
     let k = 0;
     for (let i = 0; i < src.length; i += 3) {
       const seed = Math.random();
       for (let j = 0; j < Smoke.PER_SOURCE; j++, k++) {
-        pos.set([src[i], src[i + 1], src[i + 2]], k * 3);
-        phase[k] = seed + j / Smoke.PER_SOURCE;
+        this.pos[k * 3] = src[i];
+        this.pos[k * 3 + 1] = src[i + 1];
+        this.pos[k * 3 + 2] = src[i + 2];
+        this.phase[k] = seed + j / Smoke.PER_SOURCE;
       }
     }
-    const g = this.points.geometry;
-    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    g.setAttribute('aPhase', new THREE.BufferAttribute(phase, 1));
-    g.setDrawRange(0, n);
+    markSpriteCloudDirty(this.sprite!);
+    this.sprite!.count = n;
   }
 }
 
-/** Paper sky lanterns drifting upward around the camera target (dusk and night). */
+/** Small cool-blue magic lanterns drifting upward around the camera target (dusk and night). */
 export function createSkyLanterns() {
   const n = 90;
   const pos = new Float32Array(n * 3);
@@ -72,44 +86,27 @@ export function createSkyLanterns() {
     pos[i * 3 + 2] = (Math.random() - 0.5) * 160;
     seed[i] = Math.random();
   }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  g.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
-  const m = new THREE.ShaderMaterial({
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
-    uniforms: { uTime: globalUniforms.uTime, uNight: globalUniforms.uNight, uCenter: { value: new THREE.Vector3() } },
-    vertexShader: /* glsl */ `
-      attribute float aSeed; uniform float uTime; uniform vec3 uCenter; varying float vSeed; varying float vFlick;
-      void main() {
-        vec3 p = position;
-        p.xz = mod(p.xz - uCenter.xz + 80.0, 160.0) - 80.0 + uCenter.xz;
-        float h = fract(position.y + uTime * (0.006 + aSeed * 0.006));
-        p.y = 7.0 + h * 26.0;
-        p.x += sin(uTime * 0.2 + aSeed * 30.0) * 2.0;
-        p.z += cos(uTime * 0.17 + aSeed * 21.0) * 2.0;
-        vec4 mv = modelViewMatrix * vec4(p, 1.0);
-        gl_Position = projectionMatrix * mv;
-        gl_PointSize = (6.0 + 4.0 * aSeed) * (90.0 / -mv.z) * smoothstep(0.0, 0.1, h) * smoothstep(1.0, 0.8, h);
-        vSeed = aSeed;
-        vFlick = 0.85 + 0.15 * sin(uTime * 7.0 + aSeed * 60.0);
-      }`,
-    fragmentShader: /* glsl */ `
-      uniform float uNight; varying float vSeed; varying float vFlick;
-      void main() {
-        vec2 uv = gl_PointCoord - 0.5;
-        // lantern body: rounded box, brighter at the bottom where the flame is
-        vec2 q = abs(uv * vec2(1.6, 1.25)) - vec2(0.42, 0.42);
-        float body = 1.0 - smoothstep(0.0, 0.06, length(max(q, 0.0)) + min(max(q.x, q.y), 0.0));
-        float glow = smoothstep(0.5, 0.0, length(uv)) * 0.35;
-        float flame = smoothstep(0.35, 0.0, length(uv - vec2(0.0, 0.18)));
-        vec3 c = mix(vec3(1.0, 0.45, 0.15), vec3(1.0, 0.8, 0.45), flame);
-        float a = (body * (0.55 + 0.45 * flame) + glow) * vFlick * smoothstep(0.3, 1.0, uNight);
-        gl_FragColor = vec4(c * 1.6, a);
-      }`,
+  const center = uniform(new THREE.Vector3());
+  const sprite = makeSpriteCloud(n, pos, seed, (m, P, S) => {
+    const { uTime, uNight } = globalUniforms;
+    const xz = P.xz.sub(center.xz).add(80).mod(160).sub(80).add(center.xz);
+    const h = fract(P.y.add(uTime.mul(S.mul(0.006).add(0.006))));
+    const c = vec3(
+      xz.x.add(sin(uTime.mul(0.2).add(S.mul(30))).mul(2)),
+      h.mul(26).add(7),
+      xz.y.add(sin(uTime.mul(0.17).add(S.mul(21)).add(Math.PI / 2)).mul(2)),
+    );
+    m.positionNode = c;
+    m.sizeNode = spriteSize(c, S.mul(1.2).add(1.8).mul(90).mul(smoothstep(0, 0.1, h)).mul(smoothstep(1, 0.8, h)));
+    const flick = sin(uTime.mul(1.3).add(S.mul(60))).mul(0.06).add(0.94);
+    const p = spriteUV().sub(0.5);
+    // lantern body: rounded box, brighter at the bottom where the flame is
+    const q = abs(p.mul(vec2(1.6, 1.25))).sub(vec2(0.42, 0.42));
+    const body = float(1).sub(smoothstep(0, 0.06, length(max(q, vec2(0))).add(min(max(q.x, q.y), 0))));
+    const glow = smoothstep(0.5, 0, length(p)).mul(0.35);
+    const flame = smoothstep(0.35, 0, length(p.sub(vec2(0, 0.18))));
+    m.colorNode = mix(vec3(0.22, 0.42, 1), vec3(0.65, 0.85, 1), flame).mul(1.6);
+    m.opacityNode = body.mul(flame.mul(0.45).add(0.55)).add(glow).mul(flick).mul(smoothstep(0.3, 1, uNight));
   });
-  const p = new THREE.Points(g, m);
-  p.frustumCulled = false;
-  return p;
+  return { object: sprite, center };
 }
