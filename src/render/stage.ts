@@ -474,6 +474,8 @@ export class Stage {
 
   resize() {
     const w = window.innerWidth, h = window.innerHeight;
+    // a collapsed or hidden frame reports 0×0: keep the last size (the next resize restores it)
+    if (w === 0 || h === 0) return;
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
@@ -560,6 +562,11 @@ export class Stage {
   }
 
   render() {
+    // nothing to draw into while the page has no area (WebGPU can't make a 0×0 swapchain)
+    if (window.innerWidth === 0 || window.innerHeight === 0) return;
+    // the page got its area back before the resize event did (e.g. it booted at 0×0)
+    const c = this.renderer.domElement;
+    if (c.width === 0 || c.height === 0) this.resize();
     this.pipeline.render();
   }
 
